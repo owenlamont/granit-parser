@@ -881,3 +881,168 @@ fn parser_stack_peek_surfaces_parse_error() {
         }
     }
 }
+
+#[test]
+fn nested_replay_stream_end_is_popped_and_parent_continues() {
+    let span = test_span();
+    let mut stack: MyStack = ParserStack::new();
+    stack.push_str_parser(Parser::new_from_str("parent: value"), "parent".to_string());
+    stack.push_replay_parser(
+        ReplayParser::new(vec![(Event::StreamEnd, span)], 1),
+        "empty".to_string(),
+    );
+
+    let events = collect_events(&mut stack).unwrap();
+
+    assert_eq!(
+        format_events(&events),
+        vec![
+            "StreamStart",
+            "DocStart",
+            "MapStart",
+            "Scalar(parent)",
+            "Scalar(value)",
+            "MapEnd",
+            "DocEnd",
+            "StreamEnd"
+        ]
+    );
+}
+
+#[test]
+fn parser_stack_peek_after_stream_end_returns_none() {
+    let mut stack: MyStack = ParserStack::new();
+    stack.push_str_parser(Parser::new_from_str("a: b"), "p1".to_string());
+
+    while stack.next_event().is_some() {}
+
+    assert!(stack.peek().is_none());
+}
+
+#[test]
+fn replay_child_propagates_anchor_offset_to_iter_parent() {
+    let mut stack: ParserStack<'static, alloc::vec::IntoIter<char>, StrInput<'static>> =
+        ParserStack::new();
+    let parent = "k1: &a v1\nk3: &c v3"
+        .chars()
+        .collect::<Vec<_>>()
+        .into_iter();
+    stack.push_iter_parser(Parser::new_from_iter(parent), "iter-parent".to_string());
+
+    loop {
+        let ev = stack.next_event().unwrap().unwrap().0;
+        if matches!(ev, Event::Scalar(ref value, _, _, _) if value.as_ref() == "v1") {
+            break;
+        }
+    }
+
+    let span = test_span();
+    stack.push_replay_parser(
+        ReplayParser::new(
+            vec![
+                (plain_scalar("included", 2), span),
+                (Event::StreamEnd, span),
+            ],
+            1,
+        ),
+        "replay".to_string(),
+    );
+
+    let events = collect_events(&mut stack).unwrap();
+
+    assert_eq!(find_anchor_id(&events, "included"), Some(2));
+    assert_eq!(find_anchor_id(&events, "v3"), Some(3));
+}
+
+#[test]
+fn replay_child_propagates_anchor_offset_to_custom_parent() {
+    let mut stack: MyStack = ParserStack::new();
+    stack.push_custom_parser(
+        Parser::new(StrInput::new("k1: &a v1\nk3: &c v3")),
+        "custom-parent".to_string(),
+    );
+
+    loop {
+        let ev = stack.next_event().unwrap().unwrap().0;
+        if matches!(ev, Event::Scalar(ref value, _, _, _) if value.as_ref() == "v1") {
+            break;
+        }
+    }
+
+    let span = test_span();
+    stack.push_replay_parser(
+        ReplayParser::new(
+            vec![
+                (plain_scalar("included", 2), span),
+                (Event::StreamEnd, span),
+            ],
+            1,
+        ),
+        "replay".to_string(),
+    );
+
+    let events = collect_events(&mut stack).unwrap();
+
+    assert_eq!(find_anchor_id(&events, "included"), Some(2));
+    assert_eq!(find_anchor_id(&events, "v3"), Some(3));
+}
+
+#[test]
+fn replay_child_propagates_anchor_offset_to_replay_parent() {
+    let span = test_span();
+    let mut stack: MyStack = ParserStack::new();
+    stack.push_replay_parser(
+        ReplayParser::new(vec![(plain_scalar("parent", 0), span)], 1),
+        "replay-parent".to_string(),
+    );
+    stack.push_replay_parser(
+        ReplayParser::new(
+            vec![(plain_scalar("child", 4), span), (Event::StreamEnd, span)],
+            1,
+        ),
+        "replay-child".to_string(),
+    );
+
+    assert_eq!(
+        stack.next_event().unwrap().unwrap().0,
+        plain_scalar("child", 4)
+    );
+    assert_eq!(
+        stack.next_event().unwrap().unwrap().0,
+        plain_scalar("parent", 0)
+    );
+    assert_eq!(stack.current_anchor_offset(), 5);
+}
+
+#[test]
+fn custom_parser_with_current_inherits_parent_anchor_offset() {
+    let mut stack: MyStack = ParserStack::new();
+    stack.push_str_parser(
+        Parser::new_from_str("k1: &a v1\nk3: &c v3"),
+        "parent".to_string(),
+    );
+
+    loop {
+        let ev = stack.next_event().unwrap().unwrap().0;
+        if matches!(ev, Event::Scalar(ref value, _, _, _) if value.as_ref() == "v1") {
+            break;
+        }
+    }
+
+    let span = test_span();
+    stack.push_custom_parser_with_current(
+        Parser::new(StrInput::new("k2: &b v2")),
+        "custom".to_string(),
+        (plain_scalar("primed", 0), span),
+    );
+
+    assert_eq!(stack.current_anchor_offset(), 2);
+    assert_eq!(
+        stack.next_event().unwrap().unwrap().0,
+        plain_scalar("primed", 0)
+    );
+
+    let events = collect_events(&mut stack).unwrap();
+    assert_eq!(find_anchor_id(&events, "v2"), Some(2));
+    assert_eq!(find_anchor_id(&events, "v3"), Some(3));
+}

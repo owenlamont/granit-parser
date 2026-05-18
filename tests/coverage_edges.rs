@@ -88,3 +88,34 @@ fn flow_sequence_entry_requires_comma_before_next_collection() {
         "while parsing a flow sequence, expected ',' or ']'"
     );
 }
+
+#[test]
+fn repeated_document_end_markers_do_not_start_empty_documents() {
+    let events = parse_events("...\n...\n").unwrap();
+
+    assert_eq!(events, vec![Event::StreamStart, Event::StreamEnd]);
+}
+
+#[test]
+fn block_mapping_rejects_unkeyed_content_after_nested_sequence() {
+    assert_eq!(
+        first_error_info("a:\n  - b\n c\n"),
+        "while parsing a block mapping, did not find expected key"
+    );
+}
+
+#[test]
+fn flow_mapping_requires_comma_between_pairs() {
+    assert_eq!(
+        first_error_info("{a: b c: d}"),
+        "while parsing a flow mapping, did not find expected ',' or '}'"
+    );
+}
+
+#[test]
+fn block_sequence_rejects_explicit_mapping_entry_without_dash() {
+    assert_eq!(
+        first_error_info("- a\n? b\n"),
+        "while parsing a block collection, did not find expected '-' indicator"
+    );
+}

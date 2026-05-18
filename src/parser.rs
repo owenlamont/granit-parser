@@ -1750,6 +1750,36 @@ a5: *x
     }
 
     #[test]
+    fn test_repeated_peek_returns_buffered_event() {
+        let mut parser = Parser::new_from_str("key: value\n");
+
+        let first_peek = parser.peek().unwrap().unwrap().clone();
+        let second_peek = parser.peek().unwrap().unwrap().clone();
+        let next = parser.next_event().unwrap().unwrap();
+
+        assert_eq!(first_peek, second_peek);
+        assert_eq!(first_peek, next);
+    }
+
+    #[test]
+    fn test_peek_surfaces_scan_error_without_consuming_stream_end_state() {
+        let mut parser = Parser::new_from_str("a: [1, 2");
+
+        loop {
+            match parser.peek() {
+                Some(Ok(_)) => {
+                    parser.next_event().unwrap().unwrap();
+                }
+                Some(Err(error)) => {
+                    assert_eq!(error.info(), "unclosed bracket '['");
+                    break;
+                }
+                None => panic!("expected parse error"),
+            }
+        }
+    }
+
+    #[test]
     fn test_peek_and_next_return_none_after_stream_end() {
         let mut parser = Parser::new_from_str("");
 

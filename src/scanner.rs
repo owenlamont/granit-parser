@@ -4075,6 +4075,45 @@ mod test {
         }
     }
 
+    fn first_scalar_value(input: &str) -> String {
+        let mut scanner = Scanner::new(StrInput::new(input));
+        loop {
+            match scanner.next_token().expect("scanner should not error") {
+                Some(Token(_, TokenType::Scalar(_, value))) => return value.into_owned(),
+                Some(_) => {}
+                None => panic!("expected scalar token"),
+            }
+        }
+    }
+
+    #[test]
+    fn iterator_next_records_error_and_then_stays_empty() {
+        let mut scanner = Scanner::new(StrInput::new("\"unterminated"));
+
+        while scanner.next().is_some() {}
+
+        let error = scanner
+            .get_error()
+            .expect("scanner should retain the error");
+        assert_eq!(error.info(), "unclosed quote");
+        assert!(scanner.next().is_none());
+    }
+
+    #[test]
+    fn next_token_returns_none_after_stream_end() {
+        let mut scanner = Scanner::new(StrInput::new(""));
+
+        while let Some(token) = scanner.next_token().unwrap() {
+            if matches!(token.1, TokenType::StreamEnd) {
+                break;
+            }
+        }
+
+        assert!(scanner.stream_started());
+        assert!(scanner.stream_ended());
+        assert!(scanner.next_token().unwrap().is_none());
+    }
+
     #[test]
     fn directive_name_must_be_present() {
         assert_eq!(
@@ -4092,6 +4131,14 @@ mod test {
     }
 
     #[test]
+    fn yaml_directive_requires_major_version_number() {
+        assert_eq!(
+            first_scanner_error_info("%YAML .2\n"),
+            "while scanning a YAML directive, did not find expected version number"
+        );
+    }
+
+    #[test]
     fn yaml_directive_rejects_extremely_long_version_number() {
         assert_eq!(
             first_scanner_error_info("%YAML 1234567890.2\n"),
@@ -4104,6 +4151,30 @@ mod test {
         assert_eq!(
             first_scanner_error_info("%TAG !bad tag:example.com,2024:\n"),
             "while parsing a tag directive, did not find expected '!'"
+        );
+    }
+
+    #[test]
+    fn tag_directive_handle_must_start_with_bang() {
+        assert_eq!(
+            first_scanner_error_info("%TAG bad! tag:example.com,2024:\n"),
+            "while scanning a tag, did not find expected '!'"
+        );
+    }
+
+    #[test]
+    fn tag_directive_prefix_must_start_with_tag_character() {
+        assert_eq!(
+            first_scanner_error_info("%TAG !e! `bad\n"),
+            "invalid global tag character"
+        );
+    }
+
+    #[test]
+    fn tag_directive_prefix_must_end_before_invalid_content() {
+        assert_eq!(
+            first_scanner_error_info("%TAG !e! tag:example.com^suffix\n"),
+            "while scanning TAG, did not find expected whitespace or line break"
         );
     }
 
@@ -4127,6 +4198,23 @@ mod test {
     }
 
     #[test]
+    fn bare_bang_tag_scans_as_non_specific_tag() {
+        let mut scanner = Scanner::new(StrInput::new("! foo\n"));
+
+        loop {
+            let token = scanner
+                .next_token()
+                .expect("valid tag should scan")
+                .expect("scanner must produce a tag token");
+            if let TokenType::Tag(handle, suffix) = token.1 {
+                assert_eq!(&*handle, "");
+                assert_eq!(&*suffix, "!");
+                break;
+            }
+        }
+    }
+
+    #[test]
     fn tag_requires_separation_after_suffix() {
         assert_eq!(
             first_scanner_error_info("!foo,bar\n"),
@@ -4135,11 +4223,124 @@ mod test {
     }
 
     #[test]
+    fn verbatim_tag_requires_uri() {
+        assert_eq!(
+            first_scanner_error_info("!<> foo\n"),
+            "while parsing a tag, did not find expected tag URI"
+        );
+    }
+
+    #[test]
+    fn verbatim_tag_requires_closing_angle_bracket() {
+        assert_eq!(
+            first_scanner_error_info("!<tag:yaml.org,2002:str foo\n"),
+            "while scanning a verbatim tag, did not find the expected '>'"
+        );
+    }
+
+    #[test]
+    fn tag_uri_escape_requires_hex_digits() {
+        assert_eq!(
+            first_scanner_error_info("!!bad%zz foo\n"),
+            "while parsing a tag, found an invalid escape sequence"
+        );
+    }
+
+    #[test]
+    fn tag_uri_escape_rejects_bad_leading_utf8_byte() {
+        assert_eq!(
+            first_scanner_error_info("!!bad%80 foo\n"),
+            "while parsing a tag, found an incorrect leading UTF-8 byte"
+        );
+    }
+
+    #[test]
+    fn tag_uri_escape_rejects_bad_trailing_utf8_byte() {
+        assert_eq!(
+            first_scanner_error_info("!!bad%C2%41 foo\n"),
+            "while parsing a tag, found an incorrect trailing UTF-8 byte"
+        );
+    }
+
+    #[test]
+    fn tag_uri_escape_rejects_invalid_utf8_codepoint() {
+        assert_eq!(
+            first_scanner_error_info("!!bad%F4%90%80%80 foo\n"),
+            "while parsing a tag, found an invalid UTF-8 codepoint"
+        );
+    }
+
+    #[test]
+    fn anchors_and_aliases_require_names() {
+        let expected =
+            "while scanning an anchor or alias, did not find expected alphabetic or numeric character";
+
+        assert_eq!(first_scanner_error_info("& \n"), expected);
+        assert_eq!(first_scanner_error_info("* \n"), expected);
+    }
+
+    #[test]
+    fn document_end_marker_rejects_trailing_content() {
+        assert_eq!(
+            first_scanner_error_info("... trailing\n"),
+            "invalid content after document end marker"
+        );
+    }
+
+    #[test]
+    fn reserved_indicators_are_rejected_outside_directives() {
+        assert_eq!(
+            first_scanner_error_info(" @\n"),
+            "unexpected character: `@'"
+        );
+    }
+
+    #[test]
+    fn flow_block_entry_indicator_is_rejected() {
+        assert_eq!(
+            first_scanner_error_info("[- ]\n"),
+            r#""-" is only valid inside a block"#
+        );
+    }
+
+    #[test]
+    fn block_entry_after_tabbed_separator_reports_specific_error() {
+        assert_eq!(
+            first_scanner_error_info("-\t- value\n"),
+            "'-' must be followed by a valid YAML whitespace"
+        );
+    }
+
+    #[test]
+    fn document_indicator_reports_unclosed_flow_collection() {
+        assert_eq!(first_scanner_error_info("[\n---\n"), "unclosed bracket '['");
+    }
+
+    #[test]
     fn block_scalar_header_rejects_trailing_content() {
         assert_eq!(
             first_scanner_error_info("|+ trailing\n"),
             "while scanning a block scalar, did not find expected comment or line break"
         );
+    }
+
+    #[test]
+    fn block_scalar_rejects_zero_indent_indicator() {
+        let expected = "while scanning a block scalar, found an indentation indicator equal to 0";
+
+        assert_eq!(first_scanner_error_info("|0\n"), expected);
+        assert_eq!(first_scanner_error_info("|+0\n"), expected);
+    }
+
+    #[test]
+    fn empty_block_scalar_at_eof_honors_chomping() {
+        assert_eq!(first_scalar_value("|-\n"), "");
+        assert_eq!(first_scalar_value("|+\n"), "\n");
+    }
+
+    #[test]
+    fn explicit_indent_block_scalar_can_end_at_document_marker() {
+        assert_eq!(first_scalar_value("|1\n...\n"), "");
     }
 
     #[test]
@@ -4155,6 +4356,70 @@ mod test {
         assert_eq!(
             first_scanner_error_info("\"one\n---\ntwo\"\n"),
             "while scanning a quoted scalar, found unexpected document indicator"
+        );
+    }
+
+    #[test]
+    fn quoted_scalar_rejects_tab_indentation_after_line_break() {
+        assert_eq!(
+            first_scanner_error_info("a: \"one\n\tbad\"\n"),
+            "tab cannot be used as indentation"
+        );
+    }
+
+    #[test]
+    fn quoted_scalar_rejects_underindented_continuation() {
+        assert_eq!(
+            first_scanner_error_info("a: \"one\nbad\"\n"),
+            "invalid indentation in multiline quoted scalar"
+        );
+    }
+
+    #[test]
+    fn indented_flow_scalar_reports_invalid_indentation() {
+        assert_eq!(
+            first_scanner_error_info("a:\n  [\nfoo]\n"),
+            "invalid indentation"
+        );
+    }
+
+    #[test]
+    fn required_simple_key_requires_value_at_stream_end() {
+        assert_eq!(
+            first_scanner_error_info("a:\n&b\n- c\n"),
+            "simple key expect ':'"
+        );
+    }
+
+    #[test]
+    fn plain_scalar_rejects_dash_before_flow_indicator() {
+        assert_eq!(
+            first_scanner_error_info("[-]\n"),
+            "plain scalar cannot start with '-' followed by ,[]{}"
+        );
+    }
+
+    #[test]
+    fn explicit_key_rejects_tab_after_indicator() {
+        assert_eq!(
+            first_scanner_error_info("? \tfoo\n"),
+            "tabs disallowed in this context"
+        );
+    }
+
+    #[test]
+    fn flow_mapping_rejects_adjacent_collection_value_after_plain_key() {
+        assert_eq!(
+            first_scanner_error_info("[a:[]]\n"),
+            "':' may not precede any of `[{` in flow mapping"
+        );
+    }
+
+    #[test]
+    fn implicit_flow_mapping_colon_cannot_move_to_next_line() {
+        assert_eq!(
+            first_scanner_error_info("[foo\n: bar]\n"),
+            "illegal placement of ':' indicator"
         );
     }
 }
