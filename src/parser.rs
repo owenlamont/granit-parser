@@ -337,9 +337,22 @@ pub enum TryLoadError<E> {
     ),
 }
 
-impl<E> From<ScanError> for TryLoadError<E> {
-    fn from(error: ScanError) -> Self {
+impl<E> TryLoadError<E> {
+    #[cold]
+    fn scan(error: ScanError) -> Self {
         Self::Scan(error)
+    }
+
+    #[cold]
+    fn receiver(error: E) -> Self {
+        Self::Receiver(error)
+    }
+}
+
+impl<E> From<ScanError> for TryLoadError<E> {
+    #[cold]
+    fn from(error: ScanError) -> Self {
+        Self::scan(error)
     }
 }
 
@@ -372,7 +385,7 @@ fn try_emit<'input, R>(
 where
     R: TrySpannedEventReceiver<'input>,
 {
-    recv.on_event(ev, span).map_err(TryLoadError::Receiver)
+    recv.on_event(ev, span).map_err(TryLoadError::receiver)
 }
 
 struct InfallibleSpannedReceiver<'receiver, R>(&'receiver mut R);
@@ -391,7 +404,7 @@ impl<'input, R: SpannedEventReceiver<'input>> TrySpannedEventReceiver<'input>
 fn into_scan_result(result: Result<(), TryLoadError<Infallible>>) -> Result<(), ScanError> {
     match result {
         Ok(()) => Ok(()),
-        Err(TryLoadError::Scan(error)) => Err(error),
+        Err(TryLoadError::Scan(error)) => error.into_result(),
         Err(TryLoadError::Receiver(error)) => match error {},
     }
 }
@@ -590,7 +603,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
         match token {
             None => match self.scanner.get_error() {
                 None => Err(self.unexpected_eof()),
-                Some(e) => Err(e),
+                Some(e) => e.into_result(),
             },
             Some(tok) => Ok(tok),
         }
@@ -771,7 +784,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
         recv: &mut R,
     ) -> Result<(), TryLoadError<R::Error>> {
         if !matches!(first_ev, Event::DocumentStart(_)) {
-            return Err(TryLoadError::Scan(ScanError::new_str(
+            return Err(TryLoadError::scan(ScanError::new_str(
                 span.start,
                 "did not find expected <document-start>",
             )));
@@ -1589,7 +1602,7 @@ impl<'input, T: BorrowedInput<'input>> ParserTrait<'input> for Parser<'input, T>
             }
             match self.next_event_impl() {
                 Ok(token) => self.current = Some(token),
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(e.into_result()),
             }
             self.current.as_ref().map(Ok)
         }
@@ -1625,7 +1638,7 @@ impl<'input, T: BorrowedInput<'input>> ParserTrait<'input> for Parser<'input, T>
         if !self.scanner.stream_started() || stream_start_buffered {
             let (ev, span) = self.next_event_impl()?;
             if ev != Event::StreamStart {
-                return Err(TryLoadError::Scan(ScanError::new_str(
+                return Err(TryLoadError::scan(ScanError::new_str(
                     span.start,
                     "did not find expected <stream-start>",
                 )));

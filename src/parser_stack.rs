@@ -343,7 +343,7 @@ where
                 Some(Err(e)) => {
                     let popped = self.parsers.pop().unwrap();
                     self.propagate_anchor_offset_from_popped(&popped);
-                    return Err(e);
+                    return e.into_result();
                 }
                 Some(Ok((Event::DocumentEnd, span))) => {
                     if self.parsers.len() == 1 {
@@ -411,7 +411,7 @@ where
                     self.current = Some(token);
                     Some(Ok(self.current.as_ref().unwrap()))
                 }
-                Err(e) => Some(Err(e)),
+                Err(e) => Some(e.into_result()),
             }
         }
     }
@@ -433,7 +433,7 @@ where
                 }
                 Some(Ok(token))
             }
-            Err(e) => Some(Err(e)),
+            Err(e) => Some(e.into_result()),
         }
     }
 

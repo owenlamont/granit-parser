@@ -238,6 +238,11 @@ impl ScanError {
         }
     }
 
+    #[cold]
+    pub(crate) fn into_result<T>(self) -> Result<T, ScanError> {
+        Err(self)
+    }
+
     /// Return the marker pointing to the error in the source.
     #[must_use]
     pub fn marker(&self) -> &Marker {
@@ -586,10 +591,7 @@ impl<'input, T: BorrowedInput<'input>> Iterator for Scanner<'input, T> {
                 Some(tok)
             }
             Ok(tok) => tok,
-            Err(e) => {
-                self.error = Some(e);
-                None
-            }
+            Err(e) => self.stop_after_error(e),
         }
     }
 }
@@ -898,6 +900,12 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
     #[inline]
     pub fn get_error(&self) -> Option<ScanError> {
         self.error.clone()
+    }
+
+    #[cold]
+    fn stop_after_error(&mut self, error: ScanError) -> Option<Token<'input>> {
+        self.error = Some(error);
+        None
     }
 
     #[cold]
