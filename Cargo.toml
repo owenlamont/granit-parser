@@ -10,11 +10,11 @@ authors = [
   # Later versions (serde-granit)
   "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
 ]
-categories = [ "encoding", "parser-implementations" ]
-description = "A YAML parser in pure Rust with comment and style support"
+categories = [ "encoding", "parser-implementations", "text-processing" ]
+description = "A YAML parser with comment and style support, written in pure Rust"
 documentation = "https://docs.rs/granit-parser/latest/granit_parser"
 edition = "2021"
-keywords = [ "yaml", "parser", "no-std" ]
+keywords = [ "yaml", "parser", "no-std", "cst" ]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bourumir-wyngs/granit-parser"
 
