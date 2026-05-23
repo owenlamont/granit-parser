@@ -294,6 +294,10 @@ impl<'input> Event<'input> {
     }
 }
 
+// Preserve span ordering for normal-sized comment groups. Longer runs in syntactically ambiguous
+// positions are rejected before they can grow the parser queue without bound.
+const MAX_BUFFERED_COMMENT_EVENTS: usize = 32;
+
 /// A YAML parser.
 #[derive(Debug)]
 pub struct Parser<'input, T: BorrowedInput<'input>> {
@@ -822,18 +826,25 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
     }
 
     fn next_comment_events(&mut self) -> Result<Vec<(Event<'input>, Span)>, ScanError> {
-        let mut comments = Vec::new();
+        let mut events = Vec::new();
         loop {
             match self.peek_token() {
                 Ok(token) if matches!(token.1, TokenType::Comment(_)) => {}
-                Err(error) if comments.is_empty() => return Err(error),
-                Ok(_) | Err(_) => return Ok(comments),
+                Err(error) if events.is_empty() => return Err(error),
+                Ok(_) | Err(_) => return Ok(events),
+            }
+
+            if events.len() == MAX_BUFFERED_COMMENT_EVENTS {
+                return Err(ScanError::new_str(
+                    self.peek_token()?.0.start,
+                    "too many consecutive comments before resolving collection entry",
+                ));
             }
 
             let comment = self
                 .next_comment_event()?
                 .expect("comment token disappeared after peek");
-            comments.push(comment);
+            events.push(comment);
         }
     }
 
@@ -872,6 +883,36 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             );
         }
         ordered.push(event);
+        ordered.extend(comments);
+
+        self.queue_tail_and_return_first(ordered)
+    }
+
+    fn queue_two_events_by_span(
+        &mut self,
+        comments: Vec<(Event<'input>, Span)>,
+        first: (Event<'input>, Span),
+        second: (Event<'input>, Span),
+    ) -> (Event<'input>, Span) {
+        let insert_at = comments
+            .iter()
+            .position(|(_, comment_span)| {
+                comment_span.start.index() >= first.1.start.index()
+                    && comment_span.end.index() >= first.1.end.index()
+            })
+            .unwrap_or(comments.len());
+        let mut ordered = Vec::with_capacity(comments.len() + 2);
+        let mut comments = comments.into_iter();
+
+        for _ in 0..insert_at {
+            ordered.push(
+                comments
+                    .next()
+                    .expect("comment disappeared while ordering queued events"),
+            );
+        }
+        ordered.push(first);
+        ordered.push(second);
         ordered.extend(comments);
 
         self.queue_tail_and_return_first(ordered)
@@ -1499,15 +1540,28 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             Token(mark, TokenType::BlockEntry) if indentless_sequence => {
                 self.skip();
                 let comments = self.next_comment_events()?;
-                self.pending_empty_scalar_span = Some(mark);
-                self.state = State::IndentlessSequenceEntryNode;
                 let start = (
                     Event::SequenceStart(StructureStyle::Block, anchor_id, tag),
                     mark,
                 );
                 if comments.is_empty() {
+                    self.pending_empty_scalar_span = Some(mark);
+                    self.state = State::IndentlessSequenceEntryNode;
                     Ok(start)
+                } else if let Ok(Token(
+                    _,
+                    TokenType::BlockEntry | TokenType::Key | TokenType::Value | TokenType::BlockEnd,
+                )) = self.peek_token()
+                {
+                    self.state = State::IndentlessSequenceEntry;
+                    Ok(self.queue_two_events_by_span(
+                        comments,
+                        start,
+                        (Event::empty_scalar(), mark),
+                    ))
                 } else {
+                    self.pending_empty_scalar_span = Some(mark);
+                    self.state = State::IndentlessSequenceEntryNode;
                     Ok(self.queue_event_by_span(comments, start))
                 }
             }

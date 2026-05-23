@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell, rc::Rc};
 
 use granit_parser::{
     BorrowedInput, BufferedInput, Comment, Event, EventReceiver, Marker, Parser, Placement,
@@ -7,6 +7,91 @@ use granit_parser::{
 
 fn parser_events(source: &str) -> Result<Vec<(Event<'_>, Span)>, ScanError> {
     Parser::new_from_str(source).collect()
+}
+
+/// Iterator wrapper that records how many characters the parser pulls from streaming input.
+struct CountingChars<I> {
+    /// Wrapped character iterator consumed by `Parser::new_from_iter`.
+    iter: I,
+    /// Shared count of successfully yielded characters.
+    ///
+    /// `Rc` lets the test keep a readable handle after this iterator is moved into the parser.
+    /// `Cell` gives that shared handle single-threaded interior mutability, so `next` can update
+    /// the count while the test can still read it later.
+    read: Rc<Cell<usize>>,
+}
+
+impl<I> Iterator for CountingChars<I>
+where
+    I: Iterator<Item = char>,
+{
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = self.iter.next();
+        if next.is_some() {
+            self.read.set(self.read.get() + 1);
+        }
+        next
+    }
+}
+
+fn chars_pulled_until_error(source: &str) -> (usize, String) {
+    let read = Rc::new(Cell::new(0));
+    let iter = CountingChars {
+        iter: source.chars(),
+        read: Rc::clone(&read),
+    };
+    let mut parser = Parser::new_from_iter(iter);
+
+    loop {
+        match parser
+            .next_event()
+            .expect("parser should emit an event before EOF")
+        {
+            Ok(_) => {}
+            Err(error) => return (read.get(), error.info().to_owned()),
+        }
+    }
+}
+
+fn chars_pulled_before_first_comment(source: &str) -> usize {
+    let read = Rc::new(Cell::new(0));
+    let iter = CountingChars {
+        iter: source.chars(),
+        read: Rc::clone(&read),
+    };
+    let mut parser = Parser::new_from_iter(iter);
+
+    loop {
+        let (event, _) = parser
+            .next_event()
+            .expect("parser should emit an event before EOF")
+            .expect("parser should accept generated comment run");
+        if matches!(event, Event::Comment(..)) {
+            return read.get();
+        }
+    }
+}
+
+fn long_comment_run(start: usize, count: usize) -> String {
+    let mut comments = String::new();
+    for index in start..start + count {
+        comments.push_str("# c");
+        comments.push_str(&index.to_string());
+        comments.push('\n');
+    }
+    comments
+}
+
+fn long_indented_comment_run(start: usize, count: usize) -> String {
+    let mut comments = String::new();
+    for index in start..start + count {
+        comments.push_str("  # c");
+        comments.push_str(&index.to_string());
+        comments.push('\n');
+    }
+    comments
 }
 
 fn first_empty_scalar_span(events: &[(Event<'_>, Span)]) -> Span {
@@ -720,6 +805,95 @@ fn empty_flow_mapping_value_after_comment_preserves_span_order() {
 }
 
 #[test]
+fn max_buffered_empty_node_comment_runs_preserve_span_order() {
+    let trailing_comments = long_comment_run(1, 31);
+    let cases = [
+        format!("key: # c0\n{trailing_comments}next: value\n"),
+        format!("- # c0\n{trailing_comments}- value\n"),
+        format!("key:\n- # c0\n{trailing_comments}next: value\n"),
+        format!("root: {{key: # c0\n{trailing_comments}}}\n"),
+    ];
+
+    for yaml in cases {
+        let events = parser_events(&yaml).expect("parser should accept capped comment run");
+        assert_monotonic_spans(&events);
+    }
+}
+
+#[test]
+fn parser_streams_explicit_key_comment_runs_before_reading_tail() {
+    let trailing_comments = long_indented_comment_run(1, 128);
+    let yaml = format!("? # c0\n{trailing_comments}  key\n: value\n");
+
+    let total = yaml.chars().count();
+    let pulled = chars_pulled_before_first_comment(&yaml);
+
+    assert!(
+        pulled < total / 2,
+        "parser read {pulled} of {total} chars before first explicit-key comment event",
+    );
+}
+
+#[test]
+fn explicit_key_comment_does_not_hide_tab_indentation_error() {
+    let yaml = "? # c\n\tkey\n: value\n";
+
+    let err = Parser::new_from_str(yaml)
+        .find_map(Result::err)
+        .expect("parser should reject tab indentation after explicit key comment");
+
+    assert_eq!(err.info(), "tabs disallowed in this context");
+}
+
+#[test]
+fn explicit_key_comment_run_does_not_hide_tab_indentation_error() {
+    let yaml = "? # c0\n  # c1\n  # c2\n\tkey\n: value\n";
+
+    let err = Parser::new_from_str(yaml)
+        .find_map(Result::err)
+        .expect("parser should reject tab indentation after explicit key comment run");
+
+    assert_eq!(err.info(), "tabs disallowed in this context");
+}
+
+#[test]
+fn parser_rejects_ambiguous_large_comment_runs_before_reading_tail() {
+    let trailing_comments = long_comment_run(1, 128);
+    let cases = [
+        (
+            "block mapping value",
+            format!("key: # c0\n{trailing_comments}next: value\n"),
+        ),
+        (
+            "block sequence entry",
+            format!("- # c0\n{trailing_comments}- value\n"),
+        ),
+        (
+            "indentless sequence entry",
+            format!("key:\n- # c0\n{trailing_comments}next: value\n"),
+        ),
+        (
+            "flow mapping value",
+            format!("root: {{key: # c0\n{trailing_comments}}}\n"),
+        ),
+    ];
+
+    for (name, yaml) in cases {
+        let total = yaml.chars().count();
+        let (pulled, info) = chars_pulled_until_error(&yaml);
+
+        assert_eq!(
+            info, "too many consecutive comments before resolving collection entry",
+            "{name}: unexpected parser error",
+        );
+        assert!(
+            pulled < total / 2,
+            "{name}: parser read {pulled} of {total} chars before rejecting",
+        );
+    }
+}
+
+#[test]
 fn later_empty_indentless_sequence_entry_after_comment_is_queued_before_next_key() {
     let yaml = "key:\n- first\n- # empty\nnext: value\n";
     let events = parser_events(yaml).expect("indentless sequence should parse");
@@ -770,6 +944,34 @@ fn later_indentless_sequence_entry_after_comment_keeps_value_in_sequence() {
             "Scalar(first)",
             "Comment( value)",
             "Scalar(second)",
+            "SequenceEnd",
+            "Scalar(next)",
+            "Scalar(value)",
+        ]
+    );
+}
+
+#[test]
+fn first_indentless_sequence_entry_after_comment_keeps_value_in_sequence() {
+    let yaml = "key:\n- # value\n  first\nnext: value\n";
+    let events = parser_events(yaml).expect("indentless sequence should parse");
+
+    let names: Vec<_> = events
+        .iter()
+        .filter_map(|(event, _)| match event {
+            Event::Scalar(value, ScalarStyle::Plain, ..) => Some(format!("Scalar({value})")),
+            Event::Comment(text, _) => Some(format!("Comment({text})")),
+            Event::SequenceEnd => Some("SequenceEnd".into()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        names,
+        vec![
+            "Scalar(key)",
+            "Comment( value)",
+            "Scalar(first)",
             "SequenceEnd",
             "Scalar(next)",
             "Scalar(value)",

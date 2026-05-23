@@ -688,6 +688,11 @@ pub struct Scanner<'input, T> {
     /// If a plain scalar was terminated by a `#` comment on its line, we set this
     /// to detect an illegal multiline continuation on the following line.
     interrupted_plain_by_comment: Option<Marker>,
+    /// Whether the scanner is still validating whitespace after an explicit `?` key indicator.
+    ///
+    /// This stays set across streamed comment tokens so a tab after the comment run is rejected the
+    /// same way it was when that whitespace was scanned in one pass.
+    explicit_key_tab_check_pending: bool,
     /// A stack of markers for opening brackets `[` and `{`.
     flow_markers: smallvec::SmallVec<[(Marker, char); 8]>,
     buf_leading_break: String,
@@ -1009,6 +1014,7 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
             implicit_flow_mapping_states: smallvec::SmallVec::new(),
             flow_markers: smallvec::SmallVec::new(),
             interrupted_plain_by_comment: None,
+            explicit_key_tab_check_pending: false,
 
             buf_leading_break: String::with_capacity(128),
             buf_trailing_breaks: String::with_capacity(128),
@@ -1263,7 +1269,9 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
             self.fetch_stream_start();
             return Ok(());
         }
-        self.skip_to_next_token()?;
+        if self.skip_to_next_token(true)? {
+            return Ok(());
+        }
 
         debug_print!(
             "  \x1B[38;5;244m\u{2192} fetch_next_token after whitespace {:?} {:?}\x1B[m",
@@ -1418,11 +1426,16 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
                 need_more = false;
                 // Stale potential keys that we know won't be keys.
                 self.stale_simple_keys()?;
-                // If our next token to be emitted may be a key, fetch more context.
-                for sk in &self.simple_keys {
-                    if sk.possible && sk.token_number == self.tokens_parsed {
-                        need_more = true;
-                        break;
+                if !matches!(
+                    self.tokens.front().map(|token| &token.1),
+                    Some(TokenType::Comment(_))
+                ) {
+                    // If our next token to be emitted may be a key, fetch more context.
+                    for sk in &self.simple_keys {
+                        if sk.possible && sk.token_number == self.tokens_parsed {
+                            need_more = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1474,12 +1487,13 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
     /// Skip over whitespace (`\t`, ` `, `\n`, `\r`) until the next non-comment token.
     ///
     /// Comments encountered while skipping are queued as [`TokenType::Comment`] tokens so the
-    /// parser can emit them as presentation events.
+    /// parser can emit them as presentation events. If `stop_after_comment` is true, the function
+    /// returns after queuing one comment so callers can emit it before scanning later comments.
     ///
     /// # Errors
     /// This function returns an error if a tab is encountered where there should not be
     /// one.
-    fn skip_to_next_token(&mut self) -> ScanResult {
+    fn skip_to_next_token(&mut self, stop_after_comment: bool) -> Result<bool, ScanError> {
         // Hot-path helper: consume a single logical line break and apply simple-key rules.
         // (Kept local to ensure the compiler can inline it easily.)
         let consume_linebreak = |this: &mut Self| {
@@ -1491,7 +1505,21 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
         };
 
         loop {
-            match self.input.look_ch() {
+            let ch = self.input.look_ch();
+            if self.explicit_key_tab_check_pending {
+                match ch {
+                    '\t' => {
+                        return Err(ScanError::new_str(
+                            self.mark(),
+                            "tabs disallowed in this context",
+                        ));
+                    }
+                    ' ' | '\n' | '\r' | '#' => {}
+                    _ => self.explicit_key_tab_check_pending = false,
+                }
+            }
+
+            match ch {
                 // Tabs may not be used as indentation (block context only).
                 '\t' => {
                     if self.is_within_block()
@@ -1537,6 +1565,9 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
                     if matches!(self.input.look_ch(), '\n' | '\r') {
                         consume_linebreak(self);
                     }
+                    if stop_after_comment {
+                        return Ok(true);
+                    }
                 }
 
                 _ => break,
@@ -1573,14 +1604,17 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Skip over YAML whitespace (` `, `\n`, `\r`).
     ///
+    /// If `stop_after_comment` is true, the function returns after queuing one comment so callers
+    /// can emit it before scanning later comments.
+    ///
     /// # Errors
     /// This function returns an error if no whitespace was found.
-    fn skip_yaml_whitespace(&mut self) -> ScanResult {
+    fn skip_yaml_whitespace(&mut self, stop_after_comment: bool) -> Result<bool, ScanError> {
         let mut need_whitespace = true;
         loop {
             match self.input.look_ch() {
@@ -1602,6 +1636,9 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
                         self.skip_comment();
                     } else {
                         self.push_comment_token()?;
+                        if stop_after_comment {
+                            return Ok(true);
+                        }
                     }
                 }
                 _ => break,
@@ -1611,7 +1648,7 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
         if need_whitespace {
             Err(ScanError::new_str(self.mark(), "expected whitespace"))
         } else {
-            Ok(())
+            Ok(false)
         }
     }
 
@@ -2951,8 +2988,11 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
 
         // From spec: To ensure JSON compatibility, if a key inside a flow mapping is JSON-like,
         // YAML allows the following value to be specified adjacent to the “:”.
-        self.skip_to_next_token()?;
-        self.adjacent_value_allowed_at = self.mark.index();
+        if self.skip_to_next_token(true)? {
+            self.adjacent_value_allowed_at = usize::MAX;
+        } else {
+            self.adjacent_value_allowed_at = self.mark.index();
+        }
 
         self.insert_token(token_index, tok);
         Ok(())
@@ -3620,13 +3660,15 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
 
         self.skip_non_blank();
         let token_index = self.tokens.len();
-        self.skip_yaml_whitespace()?;
+        self.explicit_key_tab_check_pending = false;
+        let stopped_after_comment = self.skip_yaml_whitespace(true)?;
         if self.input.peek() == '\t' {
             return Err(ScanError::new_str(
                 self.mark(),
                 "tabs disallowed in this context",
             ));
         }
+        self.explicit_key_tab_check_pending = stopped_after_comment;
         self.insert_token(
             token_index,
             Token(Span::new(start_mark, self.mark), TokenType::Key),
@@ -3945,7 +3987,7 @@ mod test {
 
     use crate::{
         input::{str::StrInput, BorrowedInput, BufferedInput, Input},
-        scanner::{Scanner, Token, TokenType},
+        scanner::{ScalarStyle, Scanner, Token, TokenType},
     };
 
     struct CountingChars {
@@ -4125,11 +4167,95 @@ mod test {
     fn comment_skipping_path_consumes_comment_without_tokenizing_it() {
         let mut scanner = Scanner::new(StrInput::new("# skipped\nnext: value\n"));
 
-        scanner.skip_yaml_whitespace().unwrap();
+        scanner.skip_yaml_whitespace(false).unwrap();
 
         assert!(scanner.tokens.is_empty());
         assert_eq!(scanner.mark.line(), 2);
         assert_eq!(scanner.mark.col(), 0);
+    }
+
+    #[test]
+    fn yaml_whitespace_can_stop_after_queued_comment() {
+        let mut scanner = Scanner::new(StrInput::new(" # queued\n# later\n"));
+
+        assert!(scanner.skip_yaml_whitespace(true).unwrap());
+
+        assert_eq!(scanner.tokens.len(), 1);
+        assert!(matches!(
+            scanner.tokens.front().unwrap().1,
+            TokenType::Comment(ref comment) if comment.text == " queued"
+        ));
+        assert_eq!(scanner.mark.line(), 1);
+        assert_eq!(scanner.mark.col(), 9);
+    }
+
+    #[test]
+    fn token_skip_can_stop_after_queued_comment() {
+        let mut scanner = Scanner::new(StrInput::new("# first\n# second\n"));
+
+        assert!(scanner.skip_to_next_token(true).unwrap());
+
+        assert_eq!(scanner.tokens.len(), 1);
+        assert!(matches!(
+            scanner.tokens.front().unwrap().1,
+            TokenType::Comment(ref comment) if comment.text == " first"
+        ));
+        assert_eq!(scanner.mark.line(), 2);
+        assert_eq!(scanner.mark.col(), 0);
+    }
+
+    #[test]
+    fn scanner_emits_first_leading_comment_before_scanning_next_comment() {
+        let mut scanner = Scanner::new(StrInput::new("# first\n# second\nkey: value\n"));
+
+        assert!(matches!(
+            scanner.next_token().unwrap().unwrap().1,
+            TokenType::StreamStart(_)
+        ));
+        assert!(matches!(
+            scanner.next_token().unwrap().unwrap().1,
+            TokenType::Comment(ref comment) if comment.text == " first"
+        ));
+        assert!(scanner.tokens.is_empty());
+        assert!(matches!(
+            scanner.next_token().unwrap().unwrap().1,
+            TokenType::Comment(ref comment) if comment.text == " second"
+        ));
+    }
+
+    #[test]
+    fn scanner_emits_quoted_scalar_comment_before_scanning_following_value() {
+        let mut scanner = Scanner::new(StrInput::new("\"key\" # quoted\n: value\n"));
+
+        assert!(matches!(
+            scanner.next_token().unwrap().unwrap().1,
+            TokenType::StreamStart(_)
+        ));
+        assert!(matches!(
+            scanner.next_token().unwrap().unwrap().1,
+            TokenType::Scalar(ScalarStyle::DoubleQuoted, ref value) if value == "key"
+        ));
+        assert!(matches!(
+            scanner.next_token().unwrap().unwrap().1,
+            TokenType::Comment(ref comment) if comment.text == " quoted"
+        ));
+    }
+
+    #[test]
+    fn flow_scalar_comment_disables_adjacent_value_lookahead() {
+        let mut scanner = Scanner::new(StrInput::new("\"key\"\n# quoted\n: value\n"));
+
+        scanner.fetch_flow_scalar(false).unwrap();
+
+        assert_eq!(scanner.adjacent_value_allowed_at, usize::MAX);
+        assert!(matches!(
+            scanner.tokens.front().unwrap().1,
+            TokenType::Scalar(ScalarStyle::DoubleQuoted, ref value) if value == "key"
+        ));
+        assert!(scanner.tokens.iter().any(|Token(_, token)| matches!(
+            token,
+            TokenType::Comment(comment) if comment.text == " quoted"
+        )));
     }
 
     #[test]
