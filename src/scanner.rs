@@ -1035,6 +1035,16 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
         self.tokens.insert(pos, tok);
     }
 
+    fn simple_key_token_index(&self, sk: &SimpleKey, mark: Marker) -> Result<usize, ScanError> {
+        let Some(index) = sk.token_number.checked_sub(self.tokens_parsed) else {
+            return Err(ScanError::new_str(mark, "simple key is no longer valid"));
+        };
+        if index > self.tokens.len() {
+            return Err(ScanError::new_str(mark, "simple key is no longer valid"));
+        }
+        Ok(index)
+    }
+
     #[inline]
     fn allow_simple_key(&mut self) {
         self.simple_key_allowed = true;
@@ -3414,9 +3424,10 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
         }
 
         if sk.possible {
+            let token_index = self.simple_key_token_index(&sk, start_mark)?;
             // insert simple key
             let tok = Token(Span::empty(sk.mark), TokenType::Key);
-            self.insert_token(sk.token_number - self.tokens_parsed, tok);
+            self.insert_token(token_index, tok);
             if is_implicit_flow_mapping {
                 if sk.mark.line < start_mark.line {
                     return Err(ScanError::new_str(
@@ -3425,7 +3436,7 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
                     ));
                 }
                 self.insert_token(
-                    sk.token_number - self.tokens_parsed,
+                    token_index,
                     Token(Span::empty(sk.mark), TokenType::FlowMappingStart),
                 );
             }
@@ -4437,5 +4448,25 @@ mod test {
             first_scanner_error_info("[foo\n: bar]\n"),
             "illegal placement of ':' indicator"
         );
+    }
+
+    #[test]
+    fn stale_simple_key_token_position_is_a_scan_error() {
+        let mut scanner = Scanner::new(StrInput::new(": value\n"));
+        scanner.fetch_stream_start();
+        scanner.tokens.clear();
+        scanner.tokens_parsed = 1;
+
+        let simple_key = scanner
+            .simple_keys
+            .last_mut()
+            .expect("stream start should create a simple key slot");
+        simple_key.possible = true;
+        simple_key.token_number = 0;
+
+        let error = scanner
+            .fetch_value()
+            .expect_err("stale simple key should be reported as a scan error");
+        assert_eq!(error.info(), "simple key is no longer valid");
     }
 }
