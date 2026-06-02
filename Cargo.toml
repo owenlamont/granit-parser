@@ -10,16 +10,16 @@ authors = [
   # Later versions (serde-granit)
   "Bourumir Wyngs <bourumir-wyngs@gmail.com>"
 ]
-categories = [ "encoding", "parser-implementations" ]
-description = "A YAML parser in pure Rust with strict compliance"
+categories = [ "encoding", "parser-implementations", "text-processing" ]
+description = "A YAML parser with comment and style support, written in pure Rust"
 documentation = "https://docs.rs/granit-parser/latest/granit_parser"
 edition = "2021"
-keywords = [ "yaml", "parser", "no-std" ]
+keywords = [ "yaml", "parser", "no-std", "cst" ]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bourumir-wyngs/granit-parser"
 
 rust-version = "1.81.0"
-version = "0.0.3"
+version = "0.0.4"
 exclude = [
   # Exclude the `yaml-test-suite` from the package. This removes the need to
   # add its license to the package.

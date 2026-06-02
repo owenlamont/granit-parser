@@ -39,12 +39,10 @@ pub use crate::char_traits::{
 
 /// Interface for a source of characters.
 ///
-/// Hiding the input's implementation behind this trait allows mostly:
-///  * For input-specific optimizations (for instance, using `str` methods instead of manually
-///    transferring one `char` at a time to a buffer).
-///  * To return `&str`s referencing the input string, thus avoiding potentially costly
-///    allocations. Should users need an owned version of the data, they can always `.to_owned()`
-///    their YAML object.
+/// Hiding the input's implementation behind this trait allows input-specific optimizations, such
+/// as using `str` methods instead of manually transferring one `char` at a time to a buffer.
+/// Implementations with stable backing storage can also return borrowed `&str` slices and avoid
+/// allocating token values.
 pub trait Input {
     /// A hint to the input source that we will need to read `count` characters.
     ///
@@ -61,11 +59,11 @@ pub trait Input {
     #[must_use]
     fn buflen(&self) -> usize;
 
-    /// Return the capacity of the buffer in `self`.
+    /// Return the maximum number of characters this input can buffer for lookahead.
     #[must_use]
     fn bufmaxlen(&self) -> usize;
 
-    /// Return whether the buffer (!= stream) is empty.
+    /// Return whether the lookahead buffer is empty.
     #[inline]
     #[must_use]
     fn buf_is_empty(&self) -> bool {
@@ -78,7 +76,7 @@ pub trait Input {
     #[must_use]
     fn raw_read_ch(&mut self) -> char;
 
-    /// Read a non-breakz a character from the input stream and return it directly.
+    /// Read a non-breakz character from the input stream and return it directly.
     ///
     /// The internal buffer (if any) is bypassed.
     ///
@@ -90,7 +88,7 @@ pub trait Input {
     /// Consume the next character.
     fn skip(&mut self);
 
-    /// Consume the next `count` character.
+    /// Consume the next `count` characters.
     fn skip_n(&mut self, count: usize);
 
     /// Return the next character, without consuming it.
@@ -107,7 +105,7 @@ pub trait Input {
 
     /// Return the `n`-th character in the buffer, without consuming it.
     ///
-    /// This function assumes that the n-th character in the input has already been fetched through
+    /// This function assumes that the `n`-th character in the input has already been fetched through
     /// [`Input::lookahead`].
     #[must_use]
     fn peek_nth(&self, n: usize) -> char;
@@ -160,6 +158,16 @@ pub trait Input {
         None
     }
 
+    /// Return whether this input may contain a `#` character.
+    ///
+    /// This is a conservative performance hint. Inputs that cannot answer cheaply should return
+    /// `true`, which keeps full comment handling enabled.
+    #[inline]
+    #[must_use]
+    fn may_contain_comments(&self) -> bool {
+        true
+    }
+
     /// Look for the next character and return it.
     ///
     /// The character is not consumed.
@@ -183,7 +191,7 @@ pub trait Input {
 
     /// Return whether the `n`-th character in the input source is equal to `c`.
     ///
-    /// This function assumes that the n-th character in the input has already been fetched through
+    /// This function assumes that the `n`-th character in the input has already been fetched through
     /// [`Input::lookahead`].
     #[inline]
     #[must_use]
@@ -215,7 +223,7 @@ pub trait Input {
 
     /// Check whether the next characters correspond to a document indicator.
     ///
-    /// This function assumes that the next 4 characters in the input has already been fetched
+    /// This function assumes that the next 4 characters in the input have already been fetched
     /// through [`Input::lookahead`].
     #[inline]
     #[must_use]
@@ -227,7 +235,7 @@ pub trait Input {
 
     /// Check whether the next characters correspond to a start of document.
     ///
-    /// This function assumes that the next 4 characters in the input has already been fetched
+    /// This function assumes that the next 4 characters in the input have already been fetched
     /// through [`Input::lookahead`].
     #[inline]
     #[must_use]
@@ -238,7 +246,7 @@ pub trait Input {
 
     /// Check whether the next characters correspond to an end of document.
     ///
-    /// This function assumes that the next 4 characters in the input has already been fetched
+    /// This function assumes that the next 4 characters in the input have already been fetched
     /// through [`Input::lookahead`].
     #[inline]
     #[must_use]
@@ -247,13 +255,15 @@ pub trait Input {
         self.next_3_are('.', '.', '.') && is_blank_or_breakz(self.peek_nth(3))
     }
 
-    /// Skip yaml whitespace at most up to eol. Also skips comments. Advances the input.
+    /// Skip YAML whitespace up to the end of the current line.
+    ///
+    /// Inline comments are consumed only after at least one preceding YAML whitespace character.
     ///
     /// # Return
     /// Return a tuple with the number of characters that were consumed and the result of skipping
     /// whitespace. The number of characters returned can be used to advance the index and column,
     /// since no end-of-line character will be consumed.
-    /// See [`SkipTabs`] For more details on the success variant.
+    /// See [`SkipTabs`] for more details on the success variant.
     ///
     /// # Errors
     /// Errors if a comment is encountered but it was not preceded by a whitespace. In that event,
@@ -295,6 +305,44 @@ pub trait Input {
         (
             chars_consumed,
             Ok(SkipTabs::Result(encountered_tab, has_yaml_ws)),
+        )
+    }
+
+    /// Skip YAML blank characters, stopping before comments, line breaks, or other content.
+    ///
+    /// This is the comment-aware counterpart to [`Input::skip_ws_to_eol`]: it preserves a
+    /// following `#` for the scanner to tokenize while still letting input implementations batch
+    /// the common run of spaces and tabs.
+    ///
+    /// # Return
+    /// Returns the number of consumed characters and a [`SkipTabs::Result`] describing whether
+    /// tabs and valid YAML whitespace (` `) were encountered.
+    fn skip_ws_to_eol_blanks(&mut self, skip_tabs: SkipTabs) -> (usize, SkipTabs) {
+        assert!(!matches!(skip_tabs, SkipTabs::Result(..)));
+
+        let mut encountered_tab = false;
+        let mut has_yaml_ws = false;
+        let mut chars_consumed = 0;
+
+        loop {
+            match self.look_ch() {
+                ' ' => {
+                    has_yaml_ws = true;
+                    chars_consumed += 1;
+                    self.skip();
+                }
+                '\t' if skip_tabs != SkipTabs::No => {
+                    encountered_tab = true;
+                    chars_consumed += 1;
+                    self.skip();
+                }
+                _ => break,
+            }
+        }
+
+        (
+            chars_consumed,
+            SkipTabs::Result(encountered_tab, has_yaml_ws),
         )
     }
 
@@ -545,7 +593,7 @@ pub trait Input {
 
 /// Behavior to adopt regarding treating tabs as whitespace.
 ///
-/// Although tab is a valid yaml whitespace, it doesn't always behave the same as a space.
+/// Although tab is valid YAML whitespace, it does not always behave the same as a space.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum SkipTabs {
     /// Skip all tabs as whitespace.
@@ -556,7 +604,7 @@ pub enum SkipTabs {
     Result(
         /// Whether tabs were encountered.
         bool,
-        /// Whether at least 1 valid yaml whitespace has been encountered.
+        /// Whether at least one valid YAML whitespace character has been encountered.
         bool,
     ),
 }
