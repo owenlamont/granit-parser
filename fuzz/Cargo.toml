@@ -1,0 +1,40 @@
+[package]
+name = "granit-parser-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+granit-parser = { path = ".." }
+
+[[bin]]
+name = "aliases_merges"
+path = "fuzz_targets/aliases_merges.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flow_collections"
+path = "fuzz_targets/flow_collections.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "large_scalars"
+path = "fuzz_targets/large_scalars.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "duplicate_keys"
+path = "fuzz_targets/duplicate_keys.rs"
+test = false
+doc = false
+bench = false
