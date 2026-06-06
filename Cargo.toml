@@ -19,7 +19,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bourumir-wyngs/granit-parser"
 
 rust-version = "1.81.0"
-version = "0.0.4"
+version = "0.0.5"
 exclude = [
   # Exclude the `yaml-test-suite` from the package. This removes the need to
   # add its license to the package.
@@ -36,8 +36,6 @@ arraydeque = { version = "0.5.1", default-features = false }
 smallvec = {  version = ">= 1.0.0, < 1.16.0" }
 
 [dev-dependencies]
-# Keep the test harness dependency graph compatible with Cargo/Rust 1.81.
-clap = "=4.5.48"
 libtest-mimic = "=0.8.1"
 
 [[test]]

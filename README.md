@@ -34,7 +34,7 @@ See [releases](https://github.com/bourumir-wyngs/granit-parser/releases)
 
 ## Minimal example
 
-[`Parser::new_from_str`](https://docs.rs/granit-parser/latest/granit_parser/struct.Parser.html#method.new_from_str) returns an iterator of ([`Event`](https://docs.rs/granit-parser/latest/granit_parser/enum.Event.html), [`Span`](https://docs.rs/granit-parser/latest/granit_parser/struct.Span.html)) pairs. The event helpers expose common node metadata, and spans provide byte ranges plus source slices:
+[`Parser::new_from_str`](https://docs.rs/granit-parser/latest/granit_parser/struct.Parser.html#method.new_from_str) returns an iterator of ([`Event`](https://docs.rs/granit-parser/latest/granit_parser/enum.Event.html), [`Span`](https://docs.rs/granit-parser/latest/granit_parser/struct.Span.html)) pairs. The event helpers expose common node metadata, and spans provide byte ranges, source slices, and explicit tag-token starts for tagged nodes:
 
 Comments are emitted as `Event::Comment(text, placement)`. They are presentation metadata for tools such as linters and formatters, not YAML data nodes, so consumers that build YAML values should filter them out. The companion `Span` for a comment covers the whole source comment, including `#` and excluding the line break; when parsing from `Parser::new_from_str`, `span.slice(yaml)` returns that source comment text.
 
@@ -43,8 +43,11 @@ use granit_parser::Parser;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let yaml = r#"
+%TAG !example! tag:example.com,2000:
+---
 items: !shopping
   - milk
+  - !example!sliced bread
   - !!str bread
 locations: # Example with composite keys
   [47.3769, 8.5417]: local
@@ -58,13 +61,20 @@ music: "\uD834\uDD1E\uD83C\uDFB5\uD83C\uDFB6"
         let (event, span) = next?;
 
         if let Some(tag) = event.tag() {
+            let tag_start = span
+                .tag_start()
+                .map(|mark| (mark.line(), mark.col(), mark.byte_offset()));
+
             if let Some((value, _style)) = event.scalar() {
                 println!(
-                    "scalar tag: {tag} core-str={} for {value:?}",
+                    "scalar tag: {tag} core-str={} tag_start(line,col,byte)={tag_start:?} for {value:?}",
                     tag.is_yaml_core_schema_tag("str")
                 );
             } else if event.is_node() {
-                println!("node tag: {tag} custom={}", tag.is_custom());
+                println!(
+                    "node tag: {tag} custom={} tag_start(line,col,byte)={tag_start:?}",
+                    tag.is_custom()
+                );
             }
         }
 
@@ -83,35 +93,37 @@ This prints an event stream like:
 
 ```text
 StreamStart bytes=Some(0..0) source=Some("")
-DocumentStart(false) bytes=Some(1..1) source=Some("")
-MappingStart(Block, 0, None) bytes=Some(1..1) source=Some("")
-Scalar("items", Plain, 0, None) bytes=Some(1..6) source=Some("items")
-node tag: !shopping custom=true
-SequenceStart(Block, 0, Some(Tag { handle: "!", suffix: "shopping" })) bytes=Some(20..20) source=Some("")
-Scalar("milk", Plain, 0, None) bytes=Some(22..26) source=Some("milk")
-scalar tag: tag:yaml.org,2002:str core-str=true for "bread"
-Scalar("bread", Plain, 0, Some(Tag { handle: "tag:yaml.org,2002:", suffix: "str" })) bytes=Some(37..42) source=Some("bread")
-SequenceEnd bytes=Some(43..43) source=Some("")
-Scalar("locations", Plain, 0, None) bytes=Some(43..52) source=Some("locations")
-Comment(" Example with composite keys", Right) bytes=Some(54..83) source=Some("# Example with composite keys")
-MappingStart(Block, 0, None) bytes=Some(86..86) source=Some("")
-SequenceStart(Flow, 0, None) bytes=Some(86..87) source=Some("[")
-Scalar("47.3769", Plain, 0, None) bytes=Some(87..94) source=Some("47.3769")
-Scalar("8.5417", Plain, 0, None) bytes=Some(96..102) source=Some("8.5417")
-SequenceEnd bytes=Some(102..103) source=Some("]")
-Scalar("local", Plain, 0, None) bytes=Some(105..110) source=Some("local")
-SequenceStart(Flow, 0, None) bytes=Some(113..114) source=Some("[")
-Scalar("40.7128", Plain, 0, None) bytes=Some(114..121) source=Some("40.7128")
-Scalar("-74.0060", Plain, 0, None) bytes=Some(123..131) source=Some("-74.0060")
-SequenceEnd bytes=Some(131..132) source=Some("]")
-Scalar("remote", Plain, 0, None) bytes=Some(134..140) source=Some("remote")
-Comment(" JSON-style \\uXXXX surrogate pairs:", Above) bytes=Some(142..178) source=Some("# JSON-style \\uXXXX surrogate pairs:")
-MappingEnd bytes=Some(179..179) source=Some("")
-Scalar("music", Plain, 0, None) bytes=Some(179..184) source=Some("music")
-Scalar("𝄞🎵🎶", DoubleQuoted, 0, None) bytes=Some(186..224) source=Some("\"\\uD834\\uDD1E\\uD83C\\uDFB5\\uD83C\\uDFB6\"")
-MappingEnd bytes=Some(225..225) source=Some("")
-DocumentEnd bytes=Some(225..225) source=Some("")
-StreamEnd bytes=Some(225..225) source=Some("")
+DocumentStart(true) bytes=Some(38..41) source=Some("---")
+MappingStart(Block, 0, None) bytes=Some(42..42) source=Some("")
+Scalar("items", Plain, 0, None) bytes=Some(42..47) source=Some("items")
+node tag: !shopping custom=true tag_start(line,col,byte)=Some((4, 7, Some(49)))
+SequenceStart(Block, 0, Some(Tag { handle: "!", suffix: "shopping", original_handle: "!" })) bytes=Some(61..61) source=Some("")
+Scalar("milk", Plain, 0, None) bytes=Some(63..67) source=Some("milk")
+scalar tag: tag:example.com,2000:sliced core-str=false tag_start(line,col,byte)=Some((6, 4, Some(72))) for "bread"
+Scalar("bread", Plain, 0, Some(Tag { handle: "tag:example.com,2000:", suffix: "sliced", original_handle: "!example!" })) bytes=Some(88..93) source=Some("bread")
+scalar tag: tag:yaml.org,2002:str core-str=true tag_start(line,col,byte)=Some((7, 4, Some(98))) for "bread"
+Scalar("bread", Plain, 0, Some(Tag { handle: "tag:yaml.org,2002:", suffix: "str", original_handle: "!!" })) bytes=Some(104..109) source=Some("bread")
+SequenceEnd bytes=Some(110..110) source=Some("")
+Scalar("locations", Plain, 0, None) bytes=Some(110..119) source=Some("locations")
+Comment(" Example with composite keys", Right) bytes=Some(121..150) source=Some("# Example with composite keys")
+MappingStart(Block, 0, None) bytes=Some(153..153) source=Some("")
+SequenceStart(Flow, 0, None) bytes=Some(153..154) source=Some("[")
+Scalar("47.3769", Plain, 0, None) bytes=Some(154..161) source=Some("47.3769")
+Scalar("8.5417", Plain, 0, None) bytes=Some(163..169) source=Some("8.5417")
+SequenceEnd bytes=Some(169..170) source=Some("]")
+Scalar("local", Plain, 0, None) bytes=Some(172..177) source=Some("local")
+SequenceStart(Flow, 0, None) bytes=Some(180..181) source=Some("[")
+Scalar("40.7128", Plain, 0, None) bytes=Some(181..188) source=Some("40.7128")
+Scalar("-74.0060", Plain, 0, None) bytes=Some(190..198) source=Some("-74.0060")
+SequenceEnd bytes=Some(198..199) source=Some("]")
+Scalar("remote", Plain, 0, None) bytes=Some(201..207) source=Some("remote")
+Comment(" JSON-style \\uXXXX surrogate pairs:", Above) bytes=Some(209..245) source=Some("# JSON-style \\uXXXX surrogate pairs:")
+MappingEnd bytes=Some(246..246) source=Some("")
+Scalar("music", Plain, 0, None) bytes=Some(246..251) source=Some("music")
+Scalar("𝄞🎵🎶", DoubleQuoted, 0, None) bytes=Some(253..291) source=Some("\"\\uD834\\uDD1E\\uD83C\\uDFB5\\uD83C\\uDFB6\"")
+MappingEnd bytes=Some(292..292) source=Some("")
+DocumentEnd bytes=Some(292..292) source=Some("")
+StreamEnd bytes=Some(292..292) source=Some("")
 ```
 
 ## Event API choices
@@ -226,10 +238,22 @@ This crate includes fixes to improve resilience against:
 Like the upstream parser, it does **not** interpret application-level types, so parsing YAML does not trigger external side effects.
 
 ### Improved ergonomics
-Release 0.0.3 includes ergonomic helpers such as `Event::tag`, `Event::scalar`,
-`Event::anchor_id`, `Event::alias_id`, `Event::is_node`, `Tag::parts`,
-`Tag::is_custom`, `Tag::is_yaml_core_schema_tag`, `Span::slice`, and
-`ParserStack::push_include`. See CHANGELOG.md for details.
+The following ergonomic helpers are available:
+- `Event::tag`
+- `Event::scalar`
+- `Event::anchor_id`
+- `Event::alias_id`
+- `Event::is_node`
+- `Tag::parts`
+- `Tag::original_parts`
+- `Tag::original`
+- `Tag::is_custom`
+- `Tag::is_yaml_core_schema_tag`
+- `Span::slice`
+- `Span::tag_start`
+- `ParserStack::push_include`
+
+See CHANGELOG.md for details.
 
 ## Tools
 

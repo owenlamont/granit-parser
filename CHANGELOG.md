@@ -1,7 +1,14 @@
 # Changelog
-## v0.0.4
+## v0.0.5
 - Performance improvements on comment parsing
+- Added `Span::tag_start` metadata for parser-emitted tagged node events, so diagnostics can point
+  at the explicit tag token even when the node span starts on a later line.
+- Added `Tag::original_handle`, `Tag::original_parts`, and `Tag::original` so consumers can inspect
+  the tag handle as written before `%TAG` directive resolution and reconstruct normalized
+  author-facing tag spelling, including verbatim tags (breaking change).
 
+## v0.0.4
+  Retracted
 
 ## v0.0.3
 

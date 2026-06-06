@@ -6,7 +6,9 @@
 
 use crate::{
     input::{str::StrInput, BorrowedInput},
-    scanner::{Placement, QueuedToken, QueuedTokenType, ScalarStyle, ScanError, Scanner, Span},
+    scanner::{
+        Marker, Placement, QueuedToken, QueuedTokenType, ScalarStyle, ScanError, Scanner, Span,
+    },
     BufferedInput,
 };
 
@@ -169,9 +171,43 @@ pub struct Tag {
     pub handle: String,
     /// Tag suffix following the resolved handle or prefix.
     pub suffix: String,
+    /// Tag handle as written in the source before `%TAG` directive resolution.
+    ///
+    /// For example, with `%TAG !e! tag:example.com,2000:`, a source tag `!e!keep` is resolved
+    /// as `handle = "tag:example.com,2000:"` and `suffix = "keep"`, while
+    /// `original_handle = "!e!"`.
+    pub original_handle: String,
 }
 
 impl Tag {
+    /// Create a tag from resolved parts.
+    ///
+    /// This is mainly useful for tests and consumers constructing parser-compatible tags by hand.
+    /// When the original source handle matters, use [`Self::with_original_handle`].
+    #[must_use]
+    pub fn new(handle: impl Into<String>, suffix: impl Into<String>) -> Self {
+        let handle = handle.into();
+        Self {
+            original_handle: handle.clone(),
+            handle,
+            suffix: suffix.into(),
+        }
+    }
+
+    /// Create a tag from resolved parts and the handle as written in the source.
+    #[must_use]
+    pub fn with_original_handle(
+        handle: impl Into<String>,
+        suffix: impl Into<String>,
+        original_handle: impl Into<String>,
+    ) -> Self {
+        Self {
+            handle: handle.into(),
+            suffix: suffix.into(),
+            original_handle: original_handle.into(),
+        }
+    }
+
     /// Returns whether the tag is a YAML tag from the core schema (`!!str`, `!!int`, ...).
     ///
     /// The YAML specification specifies [a list of
@@ -207,6 +243,36 @@ impl Tag {
     #[must_use]
     pub fn parts(&self) -> (&str, &str) {
         (&self.handle, &self.suffix)
+    }
+
+    /// Return the tag as `(original_handle, suffix)` using the handle from the source token.
+    ///
+    /// This is useful when a consumer needs author spelling such as `!e!keep` instead of the
+    /// resolved URI tag `tag:example.com,2000:keep`.
+    #[must_use]
+    pub fn original_parts(&self) -> (&str, &str) {
+        (&self.original_handle, &self.suffix)
+    }
+
+    /// Return the tag spelling reconstructed from the source handle and suffix.
+    ///
+    /// For ordinary shorthand tags this returns the author-facing spelling, such as `!e!keep` or
+    /// `!!str`. For verbatim tags this returns a normalized verbatim spelling such as
+    /// `!<tag:example.com,2000:thing>`, not necessarily the byte-exact source token.
+    #[must_use]
+    pub fn original(&self) -> String {
+        if self.original_handle.is_empty() && self.suffix != "!" {
+            let mut tag = String::with_capacity(self.suffix.len() + 3);
+            tag.push_str("!<");
+            tag.push_str(&self.suffix);
+            tag.push('>');
+            return tag;
+        }
+
+        let mut tag = String::with_capacity(self.original_handle.len() + self.suffix.len());
+        tag.push_str(&self.original_handle);
+        tag.push_str(&self.suffix);
+        tag
     }
 }
 
@@ -327,6 +393,8 @@ pub struct Parser<'input, T: BorrowedInput<'input>> {
     pending_node_anchor_id: usize,
     /// Pending tag to attach to a node after an intervening comment.
     pending_node_tag: Option<Cow<'input, Tag>>,
+    /// Pending explicit tag token start to attach to a node after an intervening comment.
+    pending_node_tag_start: Option<Marker>,
     /// Pending empty scalar span captured before an intervening comment.
     pending_empty_scalar_span: Option<Span>,
     /// Anchors that have been encountered in the YAML document.
@@ -684,6 +752,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             pending_key_indent: None,
             pending_node_anchor_id: 0,
             pending_node_tag: None,
+            pending_node_tag_start: None,
             pending_empty_scalar_span: None,
 
             anchors: BTreeMap::new(),
@@ -1483,9 +1552,19 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
         Ok(new_id)
     }
 
-    fn save_pending_node_properties(&mut self, anchor_id: usize, tag: Option<Cow<'input, Tag>>) {
+    fn save_pending_node_properties(
+        &mut self,
+        anchor_id: usize,
+        tag: Option<Cow<'input, Tag>>,
+        tag_start: Option<Marker>,
+    ) {
         self.pending_node_anchor_id = anchor_id;
         self.pending_node_tag = tag;
+        self.pending_node_tag_start = tag_start;
+    }
+
+    fn attach_tag_start(event: Event<'_>, span: Span, start: Option<Marker>) -> (Event<'_>, Span) {
+        (event, span.with_tag_start(start))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1499,6 +1578,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
 
         let mut anchor_id = core::mem::take(&mut self.pending_node_anchor_id);
         let mut tag = self.pending_node_tag.take();
+        let mut tag_start = self.pending_node_tag_start.take();
         match *self.peek_token()? {
             QueuedToken(_, QueuedTokenType::Alias(_)) => {
                 self.pop_state();
@@ -1518,15 +1598,18 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             QueuedToken(_, QueuedTokenType::Anchor(_)) => {
                 if let QueuedToken(span, QueuedTokenType::Anchor(name)) = self.fetch_token() {
                     anchor_id = self.register_anchor(name, &span)?;
-                    if let QueuedTokenType::Tag(..) = self.peek_token()?.1 {
-                        if let QueuedTokenType::Tag(handle, suffix) = self.fetch_token().1 {
-                            tag = Some(self.resolve_tag(span, &handle, suffix)?);
+                    if matches!(self.peek_token()?.1, QueuedTokenType::Tag(..)) {
+                        if let QueuedToken(tag_span, QueuedTokenType::Tag(handle, suffix)) =
+                            self.fetch_token()
+                        {
+                            tag_start = Some(tag_span.start);
+                            tag = Some(self.resolve_tag(tag_span, &handle, suffix)?);
                         } else {
                             unreachable!()
                         }
                     }
                     if let Some(comment) = self.maybe_next_comment_event()? {
-                        self.save_pending_node_properties(anchor_id, tag);
+                        self.save_pending_node_properties(anchor_id, tag, tag_start);
                         return Ok(comment);
                     }
                 } else {
@@ -1535,6 +1618,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             }
             QueuedToken(mark, QueuedTokenType::Tag(..)) => {
                 if let QueuedTokenType::Tag(handle, suffix) = self.fetch_token().1 {
+                    tag_start = Some(mark.start);
                     tag = Some(self.resolve_tag(mark, &handle, suffix)?);
                     if let QueuedTokenType::Anchor(_) = &self.peek_token()?.1 {
                         if let QueuedToken(mark, QueuedTokenType::Anchor(name)) = self.fetch_token()
@@ -1545,7 +1629,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
                         }
                     }
                     if let Some(comment) = self.maybe_next_comment_event()? {
-                        self.save_pending_node_properties(anchor_id, tag);
+                        self.save_pending_node_properties(anchor_id, tag, tag_start);
                         return Ok(comment);
                     }
                 } else {
@@ -1560,7 +1644,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
                 let comments = self.next_comment_events()?;
                 let start = (
                     Event::SequenceStart(StructureStyle::Block, anchor_id, tag),
-                    mark,
+                    mark.with_tag_start(tag_start),
                 );
                 if comments.is_empty() {
                     self.pending_empty_scalar_span = Some(mark);
@@ -1589,7 +1673,11 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             QueuedToken(_, QueuedTokenType::Scalar(..)) => {
                 self.pop_state();
                 if let QueuedToken(mark, QueuedTokenType::Scalar(style, v)) = self.fetch_token() {
-                    Ok((Event::Scalar(v, style, anchor_id, tag), mark))
+                    Ok(Self::attach_tag_start(
+                        Event::Scalar(v, style, anchor_id, tag),
+                        mark,
+                        tag_start,
+                    ))
                 } else {
                     unreachable!()
                 }
@@ -1597,39 +1685,47 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
             QueuedToken(mark, QueuedTokenType::FlowSequenceStart) => {
                 self.state = State::FlowSequenceFirstEntry;
                 self.skip();
-                Ok((
+                Ok(Self::attach_tag_start(
                     Event::SequenceStart(StructureStyle::Flow, anchor_id, tag),
                     mark,
+                    tag_start,
                 ))
             }
             QueuedToken(mark, QueuedTokenType::FlowMappingStart) => {
                 self.state = State::FlowMappingFirstKey;
                 self.skip();
-                Ok((
+                Ok(Self::attach_tag_start(
                     Event::MappingStart(StructureStyle::Flow, anchor_id, tag),
                     mark,
+                    tag_start,
                 ))
             }
             QueuedToken(mark, QueuedTokenType::BlockSequenceStart) if block => {
                 self.state = State::BlockSequenceFirstEntry;
                 self.skip();
-                Ok((
+                Ok(Self::attach_tag_start(
                     Event::SequenceStart(StructureStyle::Block, anchor_id, tag),
                     mark,
+                    tag_start,
                 ))
             }
             QueuedToken(mark, QueuedTokenType::BlockMappingStart) if block => {
                 self.state = State::BlockMappingFirstKey;
                 self.skip();
-                Ok((
+                Ok(Self::attach_tag_start(
                     Event::MappingStart(StructureStyle::Block, anchor_id, tag),
                     mark,
+                    tag_start,
                 ))
             }
             // ex 7.2, an empty scalar can follow a secondary tag
             QueuedToken(mark, _) if tag.is_some() || anchor_id > 0 => {
                 self.pop_state();
-                Ok((Event::empty_scalar_with_anchor(anchor_id, tag), mark))
+                Ok(Self::attach_tag_start(
+                    Event::empty_scalar_with_anchor(anchor_id, tag),
+                    mark,
+                    tag_start,
+                ))
             }
             QueuedToken(span, _) => {
                 let info = match self.state {
@@ -2163,37 +2259,29 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
         handle: &Cow<'input, str>,
         suffix: Cow<'input, str>,
     ) -> Result<Cow<'input, Tag>, ScanError> {
+        let original_handle = handle.to_string();
         let suffix = suffix.into_owned();
         let tag = if handle == "!!" {
             // "!!" is a shorthand for "tag:yaml.org,2002:". However, that default can be
             // overridden.
-            Tag {
-                handle: self
-                    .tags
+            Tag::with_original_handle(
+                self.tags
                     .get("!!")
                     .map_or_else(|| "tag:yaml.org,2002:".to_string(), ToString::to_string),
                 suffix,
-            }
+                original_handle,
+            )
         } else if handle.is_empty() && suffix == "!" {
             // "!" introduces a local tag. Local tags may have their prefix overridden.
             match self.tags.get("") {
-                Some(prefix) => Tag {
-                    handle: prefix.clone(),
-                    suffix,
-                },
-                None => Tag {
-                    handle: String::new(),
-                    suffix,
-                },
+                Some(prefix) => Tag::with_original_handle(prefix.clone(), suffix, original_handle),
+                None => Tag::with_original_handle(String::new(), suffix, original_handle),
             }
         } else {
             // Lookup handle in our tag directives.
             let prefix = self.tags.get(&**handle);
             if let Some(prefix) = prefix {
-                Tag {
-                    handle: prefix.clone(),
-                    suffix,
-                }
+                Tag::with_original_handle(prefix.clone(), suffix, original_handle)
             } else {
                 // Otherwise, it may be a local handle. With a local handle, the handle is set to
                 // "!" and the suffix to whatever follows it ("!foo" -> ("!", "foo")).
@@ -2202,10 +2290,7 @@ impl<'input, T: BorrowedInput<'input>> Parser<'input, T> {
                 if handle.len() >= 2 && handle.starts_with('!') && handle.ends_with('!') {
                     return Err(ScanError::new_str(span.start, "the handle wasn't declared"));
                 }
-                Tag {
-                    handle: handle.to_string(),
-                    suffix,
-                }
+                Tag::with_original_handle(handle.to_string(), suffix, original_handle)
             }
         };
         Ok(Cow::Owned(tag))
@@ -2401,44 +2486,68 @@ mod test {
 
     #[test]
     fn display_resolved_core_tag_without_extra_bang() {
-        let tag = Tag {
-            handle: "tag:yaml.org,2002:".to_owned(),
-            suffix: "str".to_owned(),
-        };
+        let tag = Tag::with_original_handle("tag:yaml.org,2002:", "str", "!!");
 
         assert_eq!(tag.to_string(), "tag:yaml.org,2002:str");
     }
 
     #[test]
     fn tag_helpers_distinguish_core_and_local_tags() {
-        let core = Tag {
-            handle: "tag:yaml.org,2002:".to_owned(),
-            suffix: "int".to_owned(),
-        };
-        let local = Tag {
-            handle: "!".to_owned(),
-            suffix: "thing".to_owned(),
-        };
+        let core = Tag::with_original_handle("tag:yaml.org,2002:", "int", "!!");
+        let local = Tag::new("!", "thing");
+        let non_specific = Tag::with_original_handle("", "!", "");
+        let verbatim = Tag::with_original_handle("", "tag:example.com,2000:thing", "");
 
         assert!(core.is_yaml_core_schema());
         assert!(core.is_yaml_core_schema_tag("int"));
         assert!(!core.is_yaml_core_schema_tag("str"));
         assert!(!core.is_custom());
         assert_eq!(core.parts(), ("tag:yaml.org,2002:", "int"));
+        assert_eq!(core.original_parts(), ("!!", "int"));
+        assert_eq!(core.original(), "!!int");
 
         assert!(!local.is_yaml_core_schema());
         assert!(!local.is_yaml_core_schema_tag("thing"));
         assert!(local.is_custom());
         assert_eq!(local.parts(), ("!", "thing"));
+        assert_eq!(local.original_parts(), ("!", "thing"));
+        assert_eq!(local.original(), "!thing");
         assert_eq!(local.to_string(), "!thing");
+
+        assert_eq!(non_specific.parts(), ("", "!"));
+        assert_eq!(non_specific.original_parts(), ("", "!"));
+        assert_eq!(non_specific.original(), "!");
+
+        assert_eq!(verbatim.parts(), ("", "tag:example.com,2000:thing"));
+        assert_eq!(
+            verbatim.original_parts(),
+            ("", "tag:example.com,2000:thing")
+        );
+        assert_eq!(verbatim.original(), "!<tag:example.com,2000:thing>");
+    }
+
+    #[test]
+    fn attach_tag_start_applies_marker_to_span() {
+        let event = Event::Scalar("value".into(), ScalarStyle::Plain, 0, None);
+        let span = Span::new(Marker::new(6, 1, 6), Marker::new(11, 1, 11));
+        let tag_start = Marker::new(0, 1, 0);
+
+        let (attached_event, attached_span) =
+            Parser::<crate::input::str::StrInput<'_>>::attach_tag_start(
+                event.clone(),
+                span,
+                Some(tag_start),
+            );
+
+        assert_eq!(attached_event, event);
+        assert_eq!(attached_span.start, span.start);
+        assert_eq!(attached_span.end, span.end);
+        assert_eq!(attached_span.tag_start(), Some(tag_start));
     }
 
     #[test]
     fn event_inspection_helpers_report_node_metadata() {
-        let tag = Tag {
-            handle: "!".to_owned(),
-            suffix: "thing".to_owned(),
-        };
+        let tag = Tag::new("!", "thing");
         let scalar = Event::Scalar(
             "value".into(),
             ScalarStyle::DoubleQuoted,
@@ -2859,6 +2968,8 @@ a5: *x
         assert_eq!(*anchor_id, 1);
         assert_eq!(tag.handle, "tag:yaml.org,2002:");
         assert_eq!(tag.suffix, "str");
+        assert_eq!(tag.original_handle, "!!");
+        assert_eq!(tag.original(), "!!str");
     }
 
     #[test]
@@ -2878,6 +2989,54 @@ a5: *x
         assert_eq!(*anchor_id, 1);
         assert_eq!(tag.handle, "tag:yaml.org,2002:");
         assert_eq!(tag.suffix, "str");
+        assert_eq!(tag.original_handle, "!!");
+        assert_eq!(tag.original(), "!!str");
+    }
+
+    #[test]
+    fn test_tag_directive_preserves_original_handle() {
+        let events =
+            Parser::new_from_str("%TAG !e! tag:example.com,2000:\n---\nconfig: !e!keep value\n")
+                .map(|event| event.unwrap().0)
+                .collect::<Vec<_>>();
+
+        let (value, tag) = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Scalar(value, _, _, Some(tag)) if value == "value" => Some((value, tag)),
+                _ => None,
+            })
+            .expect("expected tagged scalar");
+
+        assert_eq!(value, "value");
+        assert_eq!(tag.handle, "tag:example.com,2000:");
+        assert_eq!(tag.suffix, "keep");
+        assert_eq!(tag.original_handle, "!e!");
+        assert_eq!(tag.parts(), ("tag:example.com,2000:", "keep"));
+        assert_eq!(tag.original_parts(), ("!e!", "keep"));
+        assert_eq!(tag.original(), "!e!keep");
+    }
+
+    #[test]
+    fn test_verbatim_tag_original_is_normalized_author_spelling() {
+        let events = Parser::new_from_str("key: !<tag:example.com,2000:thing> value\n")
+            .map(|event| event.unwrap().0)
+            .collect::<Vec<_>>();
+
+        let Some(Event::Scalar(value, _, _, Some(tag))) = events
+            .iter()
+            .find(|event| matches!(event, Event::Scalar(value, ..) if value == "value"))
+        else {
+            panic!("expected tagged scalar");
+        };
+
+        assert_eq!(value, "value");
+        assert_eq!(tag.handle, "");
+        assert_eq!(tag.suffix, "tag:example.com,2000:thing");
+        assert_eq!(tag.original_handle, "");
+        assert_eq!(tag.parts(), ("", "tag:example.com,2000:thing"));
+        assert_eq!(tag.original_parts(), ("", "tag:example.com,2000:thing"));
+        assert_eq!(tag.original(), "!<tag:example.com,2000:thing>");
     }
 
     #[test]
