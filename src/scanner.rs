@@ -2956,10 +2956,14 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
                 // Otherwise, the newline after chomping is ignored.
                 Chomping::Keep => trailing_breaks,
             };
-            return Ok(Token(
-                Span::new(start_mark, self.mark),
-                TokenType::Scalar(style, contents.into()),
-            ));
+
+            let span = if contents.trim().is_empty() {
+                Span::new(start_mark, self.mark)
+            } else {
+                Span::new(start_mark, self.mark).with_indent(Some(indent))
+            };
+
+            return Ok(Token(span, TokenType::Scalar(style, contents.into())));
         }
 
         if self.mark.col < indent && (self.mark.col as isize) > self.indent {
@@ -3042,10 +3046,13 @@ impl<'input, T: BorrowedInput<'input>> Scanner<'input, T> {
             string.push_str(&trailing_breaks);
         }
 
-        Ok(Token(
-            Span::new(start_mark, self.mark),
-            TokenType::Scalar(style, string.into()),
-        ))
+        let span = if string.trim().is_empty() {
+            Span::new(start_mark, self.mark)
+        } else {
+            Span::new(start_mark, self.mark).with_indent(Some(indent))
+        };
+
+        Ok(Token(span, TokenType::Scalar(style, string.into())))
     }
 
     /// Retrieve the contents of the line, parsing it as a block scalar.

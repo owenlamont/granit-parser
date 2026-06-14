@@ -3,6 +3,8 @@
 - Added `Tag::core_suffix` and made core-tag helpers match the resolved YAML 1.2.2
   Core Schema tags (`null`, `bool`, `int`, `float`, `map`, `seq`, and `str`)
   instead of checking only the resolved handle.
+- Added `Span::indent` hints for non-empty block scalar content while leaving
+  whitespace-only block scalar spans unannotated.
 
 ## v0.0.5
 - Performance improvements on comment parsing

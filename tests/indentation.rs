@@ -1,10 +1,22 @@
-use granit_parser::{Event, Parser};
+use granit_parser::{Event, Parser, ScalarStyle};
 
 fn scalar_value<'a>(ev: &'a Event<'_>) -> Option<&'a str> {
     match ev {
         Event::Scalar(v, ..) => Some(v.as_ref()),
         _ => None,
     }
+}
+
+fn block_scalar_indents(yaml: &str) -> Vec<(String, Option<usize>)> {
+    Parser::new_from_str(yaml)
+        .map(|event| event.expect("valid yaml"))
+        .filter_map(|(event, span)| match event {
+            Event::Scalar(value, ScalarStyle::Literal | ScalarStyle::Folded, ..) => {
+                Some((value.into_owned(), span.indent))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -79,4 +91,21 @@ fn queued_key_node_after_comment_keeps_key_indent() {
     }
 
     assert_eq!(key_sequence_indent, Some(0));
+}
+
+#[test]
+fn indentation_is_reported_for_block_scalar_content() {
+    let yaml = "key: |\n  body\n";
+
+    assert_eq!(
+        block_scalar_indents(yaml),
+        vec![("body\n".to_string(), Some(2))]
+    );
+}
+
+#[test]
+fn indentation_is_not_reported_for_whitespace_only_block_scalar_content() {
+    let yaml = "key: |+\n  \n";
+
+    assert_eq!(block_scalar_indents(yaml), vec![("\n".to_string(), None)]);
 }
